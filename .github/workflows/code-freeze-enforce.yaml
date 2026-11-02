@@ -1,0 +1,266 @@
+name: Code Freeze Enforce
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Downstream release version (e.g. "1.24")'
+        required: true
+        type: string
+      freeze:
+        description: 'Whether code freeze is active ("true" or "false")'
+        required: true
+        type: string
+  schedule:
+    - cron: '*/30 * * * *'
+
+concurrency:
+  group: code-freeze-enforce-${{ inputs.version || 'cron' }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  enforce-code-freeze:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout hack repo
+        uses: actions/checkout@v6
+
+      - name: Install yq
+        run: |
+          YQ_VERSION="v4.52.4"
+          YQ_SHA256="0c4d965ea944b64b8fddaf7f27779ee3034e5693263786506ccd1c120f184e8c"
+          wget -q "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64" -O /tmp/yq
+          echo "$YQ_SHA256  /tmp/yq" | sha256sum --check --strict
+          sudo mv /tmp/yq /usr/local/bin/yq
+          sudo chmod +x /usr/local/bin/yq
+
+      - name: Enforce code freeze on PRs
+        env:
+          GH_TOKEN: ${{ secrets.OPENSHIFT_PIPELINES_ROBOT }}
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_FREEZE: ${{ inputs.freeze }}
+          ORG_NAME: "openshift-pipelines"
+        run: |
+          set -euo pipefail
+
+          # ── Config detection ──────────────────────────────────────────
+          # On manual trigger: use inputs directly.
+          # On cron: scan all release configs for any with code-freeze: true.
+          VERSIONS=()
+          FREEZE_MAP=()
+
+          if [[ -n "${INPUT_VERSION:-}" && -n "${INPUT_FREEZE:-}" ]]; then
+            # Manual trigger
+            if [[ ! "$INPUT_VERSION" =~ ^[0-9]+\.[0-9]+$ ]]; then
+              echo "ERROR: Invalid version format '$INPUT_VERSION'. Expected 'X.Y' (e.g., '1.24')"
+              exit 1
+            fi
+            VERSIONS+=("$INPUT_VERSION")
+            FREEZE_MAP+=("$INPUT_VERSION=$INPUT_FREEZE")
+          else
+            # Cron: discover frozen versions
+            echo "Cron trigger: scanning release configs for active code freezes..."
+            for RELEASE_FILE in config/downstream/releases/*.yaml; do
+              V=$(yq e '.version // ""' "$RELEASE_FILE")
+              CF=$(yq e '.code-freeze // false' "$RELEASE_FILE")
+              if [[ "$CF" == "true" && "$V" =~ ^[0-9]+\.[0-9]+$ ]]; then
+                echo "  Found active freeze: v${V}"
+                VERSIONS+=("$V")
+                FREEZE_MAP+=("$V=true")
+              fi
+            done
+
+            if [[ ${#VERSIONS[@]} -eq 0 ]]; then
+              echo "No active code freezes found. Nothing to do."
+              {
+                echo "## Code Freeze Enforce (cron)"
+                echo ""
+                echo "No active code freezes detected. Skipping."
+              } >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+          fi
+
+          # Helper: look up freeze state for a version
+          get_freeze() {
+            local v="$1"
+            for entry in "${FREEZE_MAP[@]}"; do
+              if [[ "${entry%%=*}" == "$v" ]]; then
+                echo "${entry#*=}"
+                return
+              fi
+            done
+            echo "false"
+          }
+
+          # ── Repo iteration ────────────────────────────────────────────
+          REPOS=$(yq -N e 'env(ORG_NAME) + "/" + (.repo // .name)' config/downstream/repos/*.yaml | sort -u)
+
+          TOTAL_PRS=0
+          HELD=0
+          RELEASED=0
+          SKIPPED=0
+          ERRORS=0
+          RESULTS=""
+
+          for VERSION in "${VERSIONS[@]}"; do
+            FREEZE=$(get_freeze "$VERSION")
+            CONFIG="config/downstream/releases/${VERSION}.yaml"
+
+            if [[ ! -f "$CONFIG" ]]; then
+              echo "WARNING: Release config not found: $CONFIG"
+              continue
+            fi
+
+            MARKER_LABEL="code-freeze/v${VERSION}"
+
+            echo ""
+            echo "=== Processing v${VERSION} (freeze=${FREEZE}) ==="
+
+            for FULL_REPO in $REPOS; do
+              REPO_NAME="${FULL_REPO##*/}"
+
+              # Look up the component's release branch from the branches map
+              BRANCH=$(yq e ".branches.\"${REPO_NAME}\".upstream // \"\"" "$CONFIG")
+
+              if [[ -z "$BRANCH" ]]; then
+                echo "  SKIP ${REPO_NAME}: no branch mapping in ${CONFIG}"
+                continue
+              fi
+
+              # Verify the branch exists in the target repo
+              if ! gh api "repos/${FULL_REPO}/branches/${BRANCH}" --silent 2>/dev/null; then
+                echo "  SKIP ${REPO_NAME}: branch ${BRANCH} not found"
+                continue
+              fi
+
+              echo "  Checking ${FULL_REPO} (branch: ${BRANCH})..."
+
+              # List open PRs targeting the release branch
+              PR_DATA=$(gh pr list \
+                --repo "$FULL_REPO" \
+                --base "$BRANCH" \
+                --state open \
+                --json number,labels \
+                --limit 100 2>/dev/null || echo "[]")
+
+              PR_NUMBERS=$(echo "$PR_DATA" | yq -r '.[].number' 2>/dev/null || true)
+
+              if [[ -z "$PR_NUMBERS" ]]; then
+                echo "    No open PRs targeting ${BRANCH}"
+                continue
+              fi
+
+              for PR_NUM in $PR_NUMBERS; do
+                TOTAL_PRS=$((TOTAL_PRS + 1))
+
+                # Get this PR's labels
+                PR_LABELS=$(echo "$PR_DATA" | yq -r ".[] | select(.number == ${PR_NUM}) | .labels[].name" 2>/dev/null || true)
+
+                HAS_HOLD=false
+                HAS_MARKER=false
+                for LABEL in $PR_LABELS; do
+                  if [[ "$LABEL" == "do-not-merge/hold" ]]; then
+                    HAS_HOLD=true
+                  fi
+                  if [[ "$LABEL" == "$MARKER_LABEL" ]]; then
+                    HAS_MARKER=true
+                  fi
+                done
+
+                if [[ "$FREEZE" == "true" ]]; then
+                  # Freeze: add hold + marker if not already held by us
+                  if [[ "$HAS_MARKER" == "true" ]]; then
+                    echo "    PR #${PR_NUM}: already marked with ${MARKER_LABEL}, skipping"
+                    SKIPPED=$((SKIPPED + 1))
+                    continue
+                  fi
+
+                  echo "    PR #${PR_NUM}: adding hold for code freeze v${VERSION}"
+                  if gh pr edit "$PR_NUM" --repo "$FULL_REPO" \
+                       --add-label "do-not-merge/hold" \
+                       --add-label "$MARKER_LABEL" 2>/dev/null; then
+                    FREEZE_COMMENT=$(cat <<EOFCOMMENT
+          :snowflake: **Code Freeze v${VERSION}**
+
+          This PR has been placed on hold because code freeze is active for the v${VERSION} release.
+
+          The \`do-not-merge/hold\` label has been added automatically. It will be removed when the freeze is lifted.
+
+          To bypass the freeze for an emergency fix, remove the \`${MARKER_LABEL}\` label and the \`do-not-merge/hold\` label manually.
+          EOFCOMMENT
+                    )
+                    gh pr comment "$PR_NUM" --repo "$FULL_REPO" \
+                      --body "$FREEZE_COMMENT" 2>/dev/null || true
+
+                    HELD=$((HELD + 1))
+                    RESULTS="${RESULTS}| [${REPO_NAME}#${PR_NUM}](https://github.com/${FULL_REPO}/pull/${PR_NUM}) | ${BRANCH} | Held | v${VERSION} |\n"
+                  else
+                    echo "    PR #${PR_NUM}: ERROR adding labels"
+                    ERRORS=$((ERRORS + 1))
+                    RESULTS="${RESULTS}| ${REPO_NAME}#${PR_NUM} | ${BRANCH} | Error | v${VERSION} |\n"
+                  fi
+
+                elif [[ "$FREEZE" == "false" ]]; then
+                  # Thaw: remove hold + marker only if we placed them
+                  if [[ "$HAS_MARKER" != "true" ]]; then
+                    echo "    PR #${PR_NUM}: no ${MARKER_LABEL} marker, skipping (hold not ours)"
+                    SKIPPED=$((SKIPPED + 1))
+                    continue
+                  fi
+
+                  echo "    PR #${PR_NUM}: removing hold for code thaw v${VERSION}"
+                  if gh pr edit "$PR_NUM" --repo "$FULL_REPO" \
+                       --remove-label "do-not-merge/hold" \
+                       --remove-label "$MARKER_LABEL" 2>/dev/null; then
+                    THAW_COMMENT=$(cat <<EOFCOMMENT
+          :sunny: **Code Freeze Lifted v${VERSION}**
+
+          The code freeze for v${VERSION} has been lifted. The \`do-not-merge/hold\` label has been removed.
+
+          This PR is now eligible for merge.
+          EOFCOMMENT
+                    )
+                    gh pr comment "$PR_NUM" --repo "$FULL_REPO" \
+                      --body "$THAW_COMMENT" 2>/dev/null || true
+
+                    RELEASED=$((RELEASED + 1))
+                    RESULTS="${RESULTS}| [${REPO_NAME}#${PR_NUM}](https://github.com/${FULL_REPO}/pull/${PR_NUM}) | ${BRANCH} | Released | v${VERSION} |\n"
+                  else
+                    echo "    PR #${PR_NUM}: ERROR removing labels"
+                    ERRORS=$((ERRORS + 1))
+                    RESULTS="${RESULTS}| ${REPO_NAME}#${PR_NUM} | ${BRANCH} | Error | v${VERSION} |\n"
+                  fi
+                fi
+              done
+            done
+          done
+
+          # ── Summary ───────────────────────────────────────────────────
+          echo ""
+          echo "=== Summary ==="
+          echo "Total PRs examined: $TOTAL_PRS"
+          echo "Held: $HELD | Released: $RELEASED | Skipped: $SKIPPED | Errors: $ERRORS"
+
+          {
+            echo "## Code Freeze Enforce"
+            echo ""
+            echo "**Versions:** ${VERSIONS[*]}"
+            echo ""
+            echo "| PR | Branch | Action | Version |"
+            echo "|----|--------|--------|---------|"
+            if [[ -n "$RESULTS" ]]; then
+              echo -e "$RESULTS"
+            fi
+            echo ""
+            echo "**Total PRs:** ${TOTAL_PRS} | **Held:** ${HELD} | **Released:** ${RELEASED} | **Skipped:** ${SKIPPED} | **Errors:** ${ERRORS}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [[ $ERRORS -gt 0 ]]; then
+            exit 1
+          fi
