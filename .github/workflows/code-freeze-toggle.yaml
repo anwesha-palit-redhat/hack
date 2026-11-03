@@ -1,0 +1,121 @@
+name: Code Freeze Toggle
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Downstream release version (e.g. "1.24")'
+        required: true
+        type: string
+      freeze:
+        description: 'Enable or disable code freeze'
+        required: true
+        type: choice
+        options:
+          - "true"
+          - "false"
+
+concurrency:
+  group: code-freeze-toggle-${{ inputs.version }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  toggle-code-freeze:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout hack repo
+        uses: actions/checkout@v6
+
+      - name: Install yq
+        run: |
+          YQ_VERSION="v4.52.4"
+          YQ_SHA256="0c4d965ea944b64b8fddaf7f27779ee3034e5693263786506ccd1c120f184e8c"
+          wget -q "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64" -O /tmp/yq
+          echo "$YQ_SHA256  /tmp/yq" | sha256sum --check --strict
+          sudo mv /tmp/yq /usr/local/bin/yq
+          sudo chmod +x /usr/local/bin/yq
+
+      - name: Update code-freeze flag
+        env:
+          GH_TOKEN: ${{ secrets.OPENSHIFT_PIPELINES_ROBOT }}
+          VERSION: ${{ inputs.version }}
+          FREEZE: ${{ inputs.freeze }}
+        run: |
+          set -euo pipefail
+
+          # Validate version format
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+$ ]]; then
+            echo "ERROR: Invalid version format '$VERSION'. Expected 'X.Y' (e.g., '1.24')"
+            exit 1
+          fi
+
+          RELEASE_FILE="config/downstream/releases/${VERSION}.yaml"
+
+          if [[ ! -f "$RELEASE_FILE" ]]; then
+            echo "ERROR: Release config not found: $RELEASE_FILE"
+            exit 1
+          fi
+
+          CURRENT=$(yq e '.code-freeze' "$RELEASE_FILE")
+          echo "Current code-freeze value: $CURRENT"
+          echo "Requested code-freeze value: $FREEZE"
+
+          if [[ "$CURRENT" == "$FREEZE" ]]; then
+            echo "code-freeze is already set to $FREEZE. No changes needed."
+            {
+              echo "## Code Freeze Toggle"
+              echo ""
+              echo "**Version:** ${VERSION} | **Freeze:** ${FREEZE}"
+              echo ""
+              echo "No change needed -- \`code-freeze\` is already \`${FREEZE}\`."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          yq e -i ".code-freeze = ${FREEZE}" "$RELEASE_FILE"
+          echo "Updated code-freeze to $FREEZE in $RELEASE_FILE"
+
+          git config user.name "openshift-pipelines-robot"
+          git config user.email "pipelines-robot@openshift-pipelines.noreply.github.com"
+          git add "$RELEASE_FILE"
+
+          if [[ "$FREEZE" == "true" ]]; then
+            COMMIT_MSG="chore: enable code freeze for v${VERSION}"
+          else
+            COMMIT_MSG="chore: disable code freeze for v${VERSION}"
+          fi
+
+          git commit -m "$COMMIT_MSG"
+          git push origin HEAD
+
+          echo "Committed and pushed: $COMMIT_MSG"
+
+      - name: Trigger code-freeze enforcement
+        env:
+          GH_TOKEN: ${{ secrets.OPENSHIFT_PIPELINES_ROBOT }}
+          VERSION: ${{ inputs.version }}
+          FREEZE: ${{ inputs.freeze }}
+        run: |
+          set -euo pipefail
+
+          echo "Triggering code-freeze-enforce workflow..."
+          gh workflow run code-freeze-enforce.yaml \
+            --ref "${{ github.ref_name }}" \
+            -f version="$VERSION" \
+            -f freeze="$FREEZE"
+          echo "Enforcement workflow triggered."
+
+          {
+            echo "## Code Freeze Toggle"
+            echo ""
+            echo "**Version:** ${VERSION} | **Freeze:** ${FREEZE}"
+            echo ""
+            if [[ "$FREEZE" == "true" ]]; then
+              echo "Code freeze **enabled** for v${VERSION}. Enforcement workflow dispatched."
+            else
+              echo "Code freeze **disabled** for v${VERSION}. Enforcement workflow dispatched to remove holds."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
